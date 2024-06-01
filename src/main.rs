@@ -1,4 +1,5 @@
 use std::{
+    env,
     fs::File,
     path::{Path, PathBuf},
 };
@@ -7,68 +8,92 @@ use anyhow::{anyhow, Context, Result};
 use directories::ProjectDirs;
 use flate2::{write::GzEncoder, Compression};
 use serde::Deserialize;
+use walkdir::{DirEntry, WalkDir};
 
 #[derive(Debug, Deserialize)]
 struct Config {
-    archives: Option<Vec<ArchiveConf>>,
+    archives: Option<Vec<Archive>>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ArchiveConf {
+struct Archive {
     name: String,
     input: String,
     output: String,
 }
 
-struct ArchivePath {
-    pub input: PathBuf,
-    pub output: PathBuf,
-}
-
 fn main() -> Result<()> {
     if let Some(proj_dirs) = ProjectDirs::from("", "", "arkaive") {
         let config_path = proj_dirs.config_dir().join("config.toml");
-        parse_config(&config_path.as_path())?
-            .map(|archive| expand_paths(archive))
-            .try_for_each(|archive| compress_tar_gz(archive))?;
+        let config = parse_config(&config_path)?;
+        parse_archives(config)
+            .ok_or_else(|| anyhow!("no paths were configured"))?
+            .try_for_each(|a| compress_archive(a))?;
     }
 
     Ok(())
 }
 
-fn compress_tar_gz(archive_path: ArchivePath) -> Result<()> {
-    let file = File::create(&archive_path.output)
-        .with_context(|| format!("failed creating file at {}", archive_path.output.display()))?;
+fn is_hidden(entry: &DirEntry) -> bool {
+    entry
+        .file_name()
+        .to_str()
+        .map(|s| s.starts_with("."))
+        .unwrap_or(false)
+}
+
+fn compress(input: PathBuf, output: PathBuf) -> Result<()> {
+    let current_dir = env::current_dir()?;
+
+    let file = File::create(&output)
+        .with_context(|| format!("failed creating file at {}", &output.display()))?;
     let encode = GzEncoder::new(file, Compression::default());
     let mut tar = tar::Builder::new(encode);
-    tar.append_dir_all(".", &archive_path.input)
-        .with_context(|| {
-            format!(
-                "failed creating archive at {}",
-                archive_path.input.display()
-            )
-        })?;
+
+    env::set_current_dir(input.parent().unwrap())?;
+
+    for entry in WalkDir::new(input.file_name().unwrap())
+        .into_iter()
+        .filter_entry(|e| !is_hidden(e))
+        .filter_map(|e| e.ok())
+    {
+        println!("{}", entry.path().display());
+
+        tar.append_path(entry.path())?;
+    }
+
     tar.finish()?;
+
+    env::set_current_dir(current_dir)?;
+
     Ok(())
 }
 
-fn expand_paths(archive: ArchiveConf) -> ArchivePath {
-    let input = PathBuf::from(shellexpand::tilde(&archive.input).into_owned());
-    let output = Path::new(shellexpand::tilde(&archive.output).as_ref())
-        .join("placeholder")
-        .with_file_name(archive.name)
-        .with_extension("tar.gz");
+fn compress_archive(archive: Archive) -> Result<()> {
+    let input = expand_path(Path::new(&archive.input));
+    let output = expand_path(
+        &Path::new(&archive.output)
+            .join(archive.name)
+            .with_extension("tar.gz"),
+    );
 
-    ArchivePath { input, output }
+    compress(input, output)
 }
 
-fn parse_config(path: &Path) -> Result<impl Iterator<Item = ArchiveConf>> {
+fn expand_path(path: &Path) -> PathBuf {
+    PathBuf::from(shellexpand::tilde(&path.to_str().unwrap()).as_ref())
+}
+
+fn parse_config(path: &Path) -> Result<Config> {
     let contents = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read config from {}", path.display()))?;
-    let parsed: Config = toml::from_str(contents.as_str())?;
-    if let Some(archives) = parsed.archives {
-        Ok(archives.into_iter())
-    } else {
-        Err(anyhow!("failed parsing file from {}", path.display()))
+        .with_context(|| format!("config file doesn't exist: {}", path.display()))?;
+
+    toml::from_str(contents.as_str()).with_context(|| "failed to parse config file")
+}
+
+fn parse_archives(config: Config) -> Option<impl Iterator<Item = Archive>> {
+    match config.archives {
+        Some(archives) => Some(archives.into_iter()),
+        None => None,
     }
 }
