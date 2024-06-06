@@ -1,99 +1,96 @@
 use std::{
-    env,
+    borrow::Cow,
     fs::File,
-    path::{Path, PathBuf},
+    io::{BufReader, Read, Write},
+    path::Path,
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use directories::ProjectDirs;
-use flate2::{write::GzEncoder, Compression};
-use serde::Deserialize;
-use walkdir::{DirEntry, WalkDir};
+use flate2::{bufread::GzEncoder, Compression};
 
-#[derive(Debug, Deserialize)]
-struct Config {
-    archives: Option<Vec<Archive>>,
-}
+use crate::config::{parse_archives, parse_config, Archive};
 
-#[derive(Debug, Deserialize)]
-struct Archive {
-    name: String,
-    input: String,
-    output: String,
-}
+mod config;
 
 fn main() -> Result<()> {
-    if let Some(proj_dirs) = ProjectDirs::from("", "", "arkaive") {
-        let config_path = proj_dirs.config_dir().join("config.toml");
-        let config = parse_config(&config_path)?;
-        parse_archives(config)
-            .ok_or_else(|| anyhow!("no paths were configured"))?
-            .try_for_each(|a| compress_archive(a))?;
+    let proj_dir = match ProjectDirs::from("", "", "arkaive") {
+        Some(dir) => dir,
+        None => todo!(),
+    };
+
+    let config_dir = proj_dir.config_dir();
+    let config_file_path = config_dir.join("config.toml");
+
+    let config = parse_config(&config_file_path)?;
+    let archives = match parse_archives(&config) {
+        Some(a) => a,
+        None => todo!(),
+    };
+
+    for archive in archives {
+        // iterator already returns &Archive
+        let expanded = expand_archive(archive)?;
+
+        let input = Path::new(expanded.get_input());
+        let output = Path::new(expanded.get_output())
+            // with this the path becomes /foo/bar/file.tar.gz
+            // instead of /foo/bar.tar.gz which is the
+            // intended behaviour
+            .join("placeholder")
+            .with_file_name(expanded.get_name())
+            .with_extension("tar.gz");
+
+        let compressed = compress_dir_to_vec(input, Compression::default())?;
+
+        let mut file = File::create(output)?;
+        file.write_all(&compressed)?;
     }
 
     Ok(())
 }
 
-fn is_hidden(entry: &DirEntry) -> bool {
-    entry
-        .file_name()
-        .to_str()
-        .map(|s| s.starts_with("."))
-        .unwrap_or(false)
+fn expand_path(path: &Path) -> Result<Cow<str>> {
+    let path = path.to_str().ok_or(anyhow!(
+        "{} contains non-Unicode characters",
+        path.display()
+    ))?;
+    let expanded = shellexpand::full(path)?;
+    Ok(expanded)
 }
 
-fn compress(input: PathBuf, output: PathBuf) -> Result<()> {
-    let current_dir = env::current_dir()?;
+fn expand_archive(archive: &Archive) -> Result<Archive> {
+    let name = archive.get_name();
+    let input = Path::new(archive.get_input());
+    let output = Path::new(archive.get_output());
 
-    let file = File::create(&output)
-        .with_context(|| format!("failed creating file at {}", &output.display()))?;
-    let encode = GzEncoder::new(file, Compression::default());
-    let mut tar = tar::Builder::new(encode);
+    let expanded_input = expand_path(input)?;
+    let expanded_output = expand_path(output)?;
 
-    env::set_current_dir(input.parent().unwrap())?;
-
-    for entry in WalkDir::new(input.file_name().unwrap())
-        .into_iter()
-        .filter_entry(|e| !is_hidden(e))
-        .filter_map(|e| e.ok())
-    {
-        println!("{}", entry.path().display());
-
-        tar.append_path(entry.path())?;
-    }
-
-    tar.finish()?;
-
-    env::set_current_dir(current_dir)?;
-
-    Ok(())
+    Ok(Archive::new(
+        name.to_string(),
+        expanded_input.into_owned(),
+        expanded_output.into_owned(),
+    ))
 }
 
-fn compress_archive(archive: Archive) -> Result<()> {
-    let input = expand_path(Path::new(&archive.input));
-    let output = expand_path(
-        &Path::new(&archive.output)
-            .join(archive.name)
-            .with_extension("tar.gz"),
-    );
-
-    compress(input, output)
+fn compress_dir_to_vec(path: &Path, level: Compression) -> Result<Vec<u8>> {
+    let tar = make_tar_from_dir(path)?;
+    let compressed = compress_data(&tar, level)?;
+    Ok(compressed)
 }
 
-fn expand_path(path: &Path) -> PathBuf {
-    PathBuf::from(shellexpand::tilde(&path.to_str().unwrap()).as_ref())
+fn make_tar_from_dir(path: &Path) -> Result<Vec<u8>> {
+    let buf = Vec::new();
+    let mut tar = tar::Builder::new(buf);
+    tar.append_dir_all(".", path)?;
+    Ok(tar.into_inner()?)
 }
 
-fn parse_config(path: &Path) -> Result<Config> {
-    let contents = std::fs::read_to_string(path)
-        .with_context(|| format!("config file doesn't exist: {}", path.display()))?;
-
-    toml::from_str(contents.as_str()).with_context(|| "failed to parse config file")
-}
-
-fn parse_archives(config: Config) -> Option<impl Iterator<Item = Archive>> {
-    match config.archives {
-        Some(archives) => Some(archives.into_iter()),
-        None => None,
-    }
+fn compress_data(data: &[u8], level: Compression) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    let read_buf = BufReader::new(data);
+    let mut encoder = GzEncoder::new(read_buf, level);
+    encoder.read_to_end(&mut buf)?;
+    Ok(buf)
 }
